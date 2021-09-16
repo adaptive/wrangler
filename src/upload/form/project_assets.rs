@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use failure::format_err;
+use anyhow::{anyhow, Result};
 use globset::{Candidate, Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
 use path_slash::PathExt; // Path::to_slash()
@@ -11,42 +11,27 @@ use super::filestem_from_path;
 use super::plain_text::PlainText;
 use super::text_blob::TextBlob;
 use super::wasm_module::WasmModule;
+use super::UsageModel;
 
-use crate::settings::toml::{KvNamespace, ModuleRule};
+use crate::settings::toml::{
+    migrations::ApiMigration, DurableObjectsClass, KvNamespace, ModuleRule,
+};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug)]
 pub struct ServiceWorkerAssets {
-    script_name: String,
-    script_path: PathBuf,
+    pub(crate) script_path: PathBuf,
+    pub compatibility_date: Option<String>,
+    pub compatibility_flags: Vec<String>,
     pub wasm_modules: Vec<WasmModule>,
     pub kv_namespaces: Vec<KvNamespace>,
+    pub durable_object_classes: Vec<DurableObjectsClass>,
     pub text_blobs: Vec<TextBlob>,
     pub plain_texts: Vec<PlainText>,
+    pub usage_model: Option<UsageModel>,
 }
 
 impl ServiceWorkerAssets {
-    pub fn new(
-        script_path: PathBuf,
-        wasm_modules: Vec<WasmModule>,
-        kv_namespaces: Vec<KvNamespace>,
-        text_blobs: Vec<TextBlob>,
-        plain_texts: Vec<PlainText>,
-    ) -> Result<Self, failure::Error> {
-        let script_name = filestem_from_path(&script_path).ok_or_else(|| {
-            format_err!("filename should not be empty: {}", script_path.display())
-        })?;
-
-        Ok(Self {
-            script_name,
-            script_path,
-            wasm_modules,
-            kv_namespaces,
-            text_blobs,
-            plain_texts,
-        })
-    }
-
     pub fn bindings(&self) -> Vec<Binding> {
         let mut bindings = Vec::new();
 
@@ -56,6 +41,10 @@ impl ServiceWorkerAssets {
         }
         for kv in &self.kv_namespaces {
             let binding = kv.binding();
+            bindings.push(binding);
+        }
+        for do_ns in &self.durable_object_classes {
+            let binding = do_ns.binding();
             bindings.push(binding);
         }
         for blob in &self.text_blobs {
@@ -70,8 +59,13 @@ impl ServiceWorkerAssets {
         bindings
     }
 
-    pub fn script_name(&self) -> String {
-        self.script_name.to_string()
+    pub fn script_name(&self) -> Result<String> {
+        filestem_from_path(&self.script_path).ok_or_else(|| {
+            anyhow!(
+                "filename should not be empty: {}",
+                self.script_path.display()
+            )
+        })
     }
 
     pub fn script_path(&self) -> PathBuf {
@@ -155,7 +149,7 @@ impl ModuleConfig {
         }
     }
 
-    pub fn get_modules(self) -> Result<ModuleManifest, failure::Error> {
+    pub fn get_modules(self) -> Result<ModuleManifest> {
         let matchers = build_type_matchers(self.rules)?;
 
         let candidates_vec = WalkBuilder::new(&self.dir)
@@ -178,7 +172,7 @@ impl ModuleConfig {
         paths: impl Iterator<Item = &'a P>,
         upload_dir: &'a Path,
         matchers: &'a [ModuleMatcher],
-    ) -> Result<HashMap<String, Module>, failure::Error>
+    ) -> Result<HashMap<String, Module>>
     where
         P: AsRef<Path> + ?Sized + 'a,
     {
@@ -280,14 +274,14 @@ fn new_glob(glob: &str) -> Result<Glob, globset::Error> {
         .build()
 }
 
-fn build_type_matchers(rules: Vec<ModuleRule>) -> Result<Vec<ModuleMatcher>, failure::Error> {
+fn build_type_matchers(rules: Vec<ModuleRule>) -> Result<Vec<ModuleMatcher>> {
     let mut matchers = rules
         .into_iter()
         .map(|r| {
             let mut builder = GlobSetBuilder::new();
 
             for glob in &r.globs {
-                let glob = new_glob(&glob)?;
+                let glob = new_glob(glob)?;
                 builder.add(glob);
             }
 
@@ -298,7 +292,7 @@ fn build_type_matchers(rules: Vec<ModuleRule>) -> Result<Vec<ModuleMatcher>, fai
                 fallthrough: r.fallthrough,
             })
         })
-        .collect::<Result<Vec<_>, failure::Error>>()?;
+        .collect::<Result<Vec<_>>>()?;
 
     ModuleType::iter().try_for_each::<_, Result<(), globset::Error>>(|t| {
         let mut builder = GlobSetBuilder::new();
@@ -318,21 +312,37 @@ fn build_type_matchers(rules: Vec<ModuleRule>) -> Result<Vec<ModuleMatcher>, fai
 }
 
 pub struct ModulesAssets {
+    pub compatibility_date: Option<String>,
+    pub compatibility_flags: Vec<String>,
     pub manifest: ModuleManifest,
     pub kv_namespaces: Vec<KvNamespace>,
+    pub durable_object_classes: Vec<DurableObjectsClass>,
+    pub migration: Option<ApiMigration>,
     pub plain_texts: Vec<PlainText>,
+    pub usage_model: Option<UsageModel>,
 }
 
 impl ModulesAssets {
+    #[allow(clippy::too_many_arguments)] // TODO: refactor?
     pub fn new(
+        compatibility_date: Option<String>,
+        compatibility_flags: Vec<String>,
         manifest: ModuleManifest,
         kv_namespaces: Vec<KvNamespace>,
+        durable_object_classes: Vec<DurableObjectsClass>,
+        migration: Option<ApiMigration>,
         plain_texts: Vec<PlainText>,
-    ) -> Result<Self, failure::Error> {
+        usage_model: Option<UsageModel>,
+    ) -> Result<Self> {
         Ok(Self {
+            compatibility_date,
+            compatibility_flags,
             manifest,
             kv_namespaces,
+            durable_object_classes,
+            migration,
             plain_texts,
+            usage_model,
         })
     }
 
@@ -344,6 +354,10 @@ impl ModulesAssets {
 
         for kv in &self.kv_namespaces {
             let binding = kv.binding();
+            bindings.push(binding);
+        }
+        for class in &self.durable_object_classes {
+            let binding = class.binding();
             bindings.push(binding);
         }
         for plain_text in &self.plain_texts {
@@ -411,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn default_globs() -> Result<(), failure::Error> {
+    fn default_globs() -> Result<()> {
         init();
         test_success! {
             ModuleConfig {
@@ -460,7 +474,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_globs() -> Result<(), failure::Error> {
+    fn custom_globs() -> Result<()> {
         init();
         test_success! {
             ModuleConfig {

@@ -9,8 +9,9 @@ use crate::wranglerjs;
 use crate::{build::command, build_target};
 use crate::{commands, install};
 
+use anyhow::Result;
 use notify::{self, RecursiveMode, Watcher};
-use std::sync::mpsc;
+use std::sync::mpsc::{self, SendError, Sender};
 use std::thread;
 use std::time::Duration;
 
@@ -26,13 +27,14 @@ const RUST_IGNORE: &[&str] = &["pkg", "target", "worker/generated"];
 pub fn watch_and_build(
     target: &Target,
     tx: Option<mpsc::Sender<()>>,
-) -> Result<(), failure::Error> {
+    refresh_session_sender: Option<Sender<Option<()>>>,
+) -> Result<()> {
     let target_type = &target.target_type;
     let build = target.build.clone();
     match target_type {
         TargetType::JavaScript => {
             let target = target.clone();
-            thread::spawn::<_, Result<(), failure::Error>>(move || {
+            thread::spawn::<_, Result<()>>(move || {
                 let (watcher_tx, watcher_rx) = mpsc::channel();
                 let mut watcher = notify::watcher(watcher_tx, Duration::from_secs(1))?;
 
@@ -42,15 +44,21 @@ pub fn watch_and_build(
                         StdOut::info(&format!("watching {:?}", &JAVASCRIPT_PATH));
 
                         loop {
-                            match wait_for_changes(&watcher_rx, COOLDOWN_PERIOD) {
+                            match wait_for_changes(
+                                &watcher_rx,
+                                refresh_session_sender.clone(),
+                                COOLDOWN_PERIOD,
+                            ) {
                                 Ok(_path) => {
                                     if let Some(tx) = tx.clone() {
-                                        tx.send(()).expect("--watch change message failed to send");
+                                        tx.send(())?;
                                     }
                                 }
                                 Err(e) => {
-                                    log::debug!("{:?}", e);
-                                    StdOut::user_error("Something went wrong while watching.")
+                                    if !e.is::<SendError<Option<()>>>() {
+                                        log::debug!("{:?}", e);
+                                        StdOut::user_error("Something went wrong while watching.")
+                                    }
                                 }
                             }
                         }
@@ -60,20 +68,25 @@ pub fn watch_and_build(
                         watcher.watch(config.watch_dir, notify::RecursiveMode::Recursive)?;
 
                         loop {
-                            match wait_for_changes(&watcher_rx, COOLDOWN_PERIOD) {
+                            match wait_for_changes(
+                                &watcher_rx,
+                                refresh_session_sender.clone(),
+                                COOLDOWN_PERIOD,
+                            ) {
                                 Ok(_path) => match build_target(&target) {
                                     Ok(output) => {
                                         StdOut::success(&output);
                                         if let Some(tx) = tx.clone() {
-                                            tx.send(())
-                                                .expect("--watch change message failed to send");
+                                            tx.send(())?;
                                         }
                                     }
                                     Err(e) => StdOut::user_error(&e.to_string()),
                                 },
                                 Err(e) => {
-                                    log::debug!("{:?}", e);
-                                    StdOut::user_error("Something went wrong while watching.")
+                                    if !e.is::<SendError<Option<()>>>() {
+                                        log::debug!("{:?}", e);
+                                        StdOut::user_error("Something went wrong while watching.")
+                                    }
                                 }
                             }
                         }
@@ -85,7 +98,7 @@ pub fn watch_and_build(
             let binary_path = install::install_wasm_pack()?;
             let args = ["build", "--target", "no-modules"];
 
-            thread::spawn(move || {
+            thread::spawn::<_, Result<()>>(move || {
                 let (watcher_tx, watcher_rx) = mpsc::channel();
                 let mut watcher = notify::watcher(watcher_tx, Duration::from_secs(1)).unwrap();
 
@@ -113,17 +126,25 @@ pub fn watch_and_build(
                 StdOut::info(&format!("watching {:?}", &RUST_PATH));
 
                 loop {
-                    match wait_for_changes(&watcher_rx, COOLDOWN_PERIOD) {
+                    match wait_for_changes(
+                        &watcher_rx,
+                        refresh_session_sender.clone(),
+                        COOLDOWN_PERIOD,
+                    ) {
                         Ok(_path) => {
                             let command = command(&args, &binary_path);
                             let command_name = format!("{:?}", command);
                             if commands::run(command, &command_name).is_ok() {
                                 if let Some(tx) = tx.clone() {
-                                    tx.send(()).expect("--watch change message failed to send");
+                                    tx.send(())?;
                                 }
                             }
                         }
-                        Err(_) => StdOut::user_error("Something went wrong while watching."),
+                        Err(e) => {
+                            if !e.is::<SendError<Option<()>>>() {
+                                StdOut::user_error("Something went wrong while watching.")
+                            }
+                        }
                     }
                 }
             });

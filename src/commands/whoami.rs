@@ -7,27 +7,38 @@ use cloudflare::endpoints::user::GetUserDetails;
 use cloudflare::framework::apiclient::ApiClient;
 use cloudflare::framework::response::ApiFailure;
 
+use anyhow::Result;
 use prettytable::{Cell, Row, Table};
 
+/// Return a string representing the token type based on user
+fn get_token_type(
+    user: &GlobalUser,
+    missing_permissions: &mut Vec<String>,
+    token_type: &str,
+) -> Result<String> {
+    if let Some(token_auth_email) = fetch_auth_token_email(user, missing_permissions)? {
+        Ok(format!(
+            "an {} Token, associated with the email '{}'",
+            token_type, token_auth_email,
+        ))
+    } else {
+        let wrangler_login_msg = styles::highlight("`wrangler login`");
+        let wrangler_config_msg = styles::highlight("`wrangler config`");
+        anyhow::bail!("Failed to retrieve information about the email associated with {} token. Please run {} or {}.", token_type, wrangler_login_msg, wrangler_config_msg)
+    }
+}
+
 /// Tells the user who they are
-pub fn whoami(user: &GlobalUser) -> Result<(), failure::Error> {
+pub fn whoami(user: &GlobalUser) -> Result<()> {
     let mut missing_permissions: Vec<String> = Vec::with_capacity(2);
     // Attempt to print email for both GlobalKeyAuth and TokenAuth users
     let auth: String = match user {
         GlobalUser::GlobalKeyAuth { email, .. } => {
             format!("a Global API Key, associated with the email '{}'", email,)
         }
-        GlobalUser::TokenAuth { .. } => {
-            let token_auth_email = fetch_api_token_email(user, &mut missing_permissions)?;
-
-            if let Some(token_auth_email) = token_auth_email {
-                format!(
-                    "an API Token, associated with the email '{}'",
-                    token_auth_email,
-                )
-            } else {
-                "an API Token".to_string()
-            }
+        GlobalUser::ApiTokenAuth { .. } => get_token_type(user, &mut missing_permissions, "API")?,
+        GlobalUser::OAuthTokenAuth { .. } => {
+            get_token_type(user, &mut missing_permissions, "OAuth")?
         }
     };
 
@@ -88,10 +99,10 @@ pub fn display_account_id_maybe() {
     }
 }
 
-fn fetch_api_token_email(
+fn fetch_auth_token_email(
     user: &GlobalUser,
     missing_permissions: &mut Vec<String>,
-) -> Result<Option<String>, failure::Error> {
+) -> Result<Option<String>> {
     let client = http::cf_v4_client(user)?;
     let response = client.request(&GetUserDetails {});
     match response {
@@ -99,23 +110,41 @@ fn fetch_api_token_email(
         Err(e) => match e {
             ApiFailure::Error(_, api_errors) => {
                 let error = &api_errors.errors[0];
+
                 if error.code == 9109 {
                     missing_permissions.push("User Details: Read".to_string());
                 }
                 Ok(None)
             }
-            ApiFailure::Invalid(_) => failure::bail!(http::format_error(e, None)),
+            ApiFailure::Invalid(_) => anyhow::bail!(http::format_error(e, None)),
         },
     }
 }
 
 /// Fetch the accounts associated with a user
-fn fetch_accounts(user: &GlobalUser) -> Result<Vec<Account>, failure::Error> {
+pub(crate) fn fetch_accounts(user: &GlobalUser) -> Result<Vec<Account>> {
     let client = http::cf_v4_client(user)?;
     let response = client.request(&account::ListAccounts { params: None });
     match response {
         Ok(res) => Ok(res.result),
-        Err(e) => failure::bail!(http::format_error(e, None)),
+        Err(e) => {
+            match e {
+                ApiFailure::Error(_, ref api_errors) => {
+                    let error = &api_errors.errors[0];
+                    if error.code == 9109 {
+                        // 9109 error code = Invalid access token
+                        StdOut::info("Your API token might be expired, or might not have the necessary permissions. Please re-authenticate wrangler by running `wrangler login` or `wrangler config`.");
+                    } else if error.code == 6003 {
+                        // 6003 error code = Invalid request headers. A common case is when the value of an authorization method has been changed outside of wrangler commands
+                        StdOut::info("Your authentication method might be corrupted (e.g. API token value has been altered). Please re-authenticate wrangler by running `wrangler login` or `wrangler config`.");
+                    }
+
+                }
+                ApiFailure::Invalid(_) => StdOut::info("Something went wrong in processing a request. Please consider raising an issue at https://github.com/cloudflare/wrangler/issues"),
+            }
+
+            anyhow::bail!(http::format_error(e, None))
+        }
     }
 }
 
@@ -129,9 +158,12 @@ fn format_accounts(
     let table_head = Row::new(vec![Cell::new("Account Name"), Cell::new("Account ID")]);
     table.add_row(table_head);
 
-    if let GlobalUser::TokenAuth { .. } = user {
-        if accounts.is_empty() {
-            missing_permissions.push("Account Settings: Read".to_string());
+    match user {
+        GlobalUser::GlobalKeyAuth { .. } => (),
+        _ => {
+            if accounts.is_empty() {
+                missing_permissions.push("Account Settings: Read".to_string());
+            }
         }
     }
 
